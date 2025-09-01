@@ -1,0 +1,33 @@
+# Node modules
+node_modules/
+
+# Environment variables
+.env
+
+# WhatsApp authentication data
+.wwebjs_auth/
+
+# Generated images
+images/
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor directories and files
+.idea/
+.vscode/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+*.sh
+.wwebjs_auth
+.wwebjs_cache

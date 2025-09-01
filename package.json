@@ -1,0 +1,29 @@
+{
+    "name": "whatsapp-webhook-messenger",
+    "version": "1.0.0",
+    "main": "index.js",
+    "scripts": {
+        "start": "node index.js",
+        "test": "echo \"Error: no test specified\" && exit 1"
+    },
+    "keywords": [
+        "whatsapp",
+        "webhook",
+        "api",
+        "messaging"
+    ],
+    "author": "",
+    "license": "MIT",
+    "description": "WhatsApp webhook API for sending messages to groups",
+    "dependencies": {
+        "cors": "^2.8.5",
+        "dotenv": "^16.4.0",
+        "express": "^4.18.2",
+        "fs-extra": "^11.2.0",
+        "node-schedule": "^2.1.1",
+        "puppeteer": "^18.2.1",
+        "qrcode-terminal": "^0.12.0",
+        "uuid": "^9.0.1",
+        "whatsapp-web.js": "1.33.1"
+    }
+}
