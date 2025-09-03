@@ -225,8 +225,8 @@ router.post('/send-batch', apiKeyAuth, async (req, res) => {
     }
 
     // Wait a bit to ensure client is ready
-    logger.info('Waiting to ensure WhatsApp client is ready...');
-    await new Promise(resolve => setTimeout(resolve, 3000));
+    // logger.info('Waiting to ensure WhatsApp client is ready...');
+    // await new Promise(resolve => setTimeout(resolve, 3000));
 
     let successCount = 0;
     let failureCount = 0;
@@ -354,6 +354,7 @@ router.post('/send-batch', apiKeyAuth, async (req, res) => {
 
     logger.info(`Batch processing completed: ${successCount} successful, ${failureCount} failed`);
   } catch (error) {
+    console.log(error)
     logger.error('Fatal error in batch processing:', error);
   }
 });
