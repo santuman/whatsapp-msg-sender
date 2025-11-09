@@ -3,51 +3,19 @@ const fs = require('fs');
 const path = require('path');
 const express = require('express');
 const cors = require('cors');
-const { Client, LocalAuth, } = require('whatsapp-web.js');
+const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, makeCacheableSignalKeyStore } = require('@whiskeysockets/baileys');
+const pino = require('pino');
 const { router: webhookRouter } = require('./routes/webhook');
 const { setupImageCleanupScheduler } = require('./utils/imageUtils');
 const { setWhatsAppClient } = require('./whatsappclient');
-const logger = console;
 
-process.setMaxListeners(15); // Increase the limit from default 10 to 15
-const logFilePath = path.join(__dirname, 'sc_commands.txt')
-
+process.setMaxListeners(15);
+const logFilePath = path.join(__dirname, 'sc_commands.txt');
 
 // Load environment variables
 require('dotenv').config();
 
-
-const config = {
-    puppeteerOptions: {
-      args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-gpu',
-        '--no-first-run',
-        '--disable-web-security',
-        '--disable-features=VizDisplayCompositor',
-        '--ignore-certificate-errors',
-        '--ignore-ssl-errors',
-        '--ignore-certificate-errors-spki-list',
-        '--disable-background-timer-throttling',
-        '--disable-backgrounding-occluded-windows',
-        '--disable-renderer-backgrounding'
-      ],
-      headless: true,
-      timeout: 180000, // Increased timeout
-      defaultViewport: null,
-    },
-    retry: {
-      maxAttempts: 3,
-      initialDelay: 5000,
-      maxDelay: 30000,
-    },
-    executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || '/usr/bin/chromium-browser',
-    server: {
-      port: process.env.PORT || 3000,
-    }
-};
+const logger = pino({ level: process.env.LOG_LEVEL || 'info' });
 
 // Initialize Express server
 const app = express();
@@ -57,174 +25,192 @@ app.use(cors());
 // Add webhook routes
 app.use('/api/webhook', webhookRouter);
 
-    // Add status endpoint
-    app.get('/api/status', (req, res) => {
-      const { getWhatsAppClient } = require('./whatsappclient');
-      const client = getWhatsAppClient();
-      if (client) {
-        res.json({ success: true, message: 'WhatsApp client is ready.' });
-      } else {
-        res.status(503).json({ success: false, message: 'WhatsApp client is not ready.' });
+// Add status endpoint
+app.get('/api/status', (req, res) => {
+  const { getWhatsAppClient } = require('./whatsappclient');
+  const client = getWhatsAppClient();
+  if (client) {
+    res.json({ success: true, message: 'WhatsApp client is ready.' });
+  } else {
+    res.status(503).json({ success: false, message: 'WhatsApp client is not ready.' });
+  }
+});
+
+// Global variable to hold the socket connection
+let sock = null;
+let isConnected = false;
+
+// Initialize WhatsApp client with Baileys
+async function initializeClient() {
+  try {
+    const authFolder = path.join(__dirname, 'baileys_auth');
+
+    // Ensure auth folder exists
+    if (!fs.existsSync(authFolder)) {
+      fs.mkdirSync(authFolder, { recursive: true });
+    }
+
+    // Load auth state
+    const { state, saveCreds } = await useMultiFileAuthState(authFolder);
+
+    // Get latest baileys version
+    const { version, isLatest } = await fetchLatestBaileysVersion();
+    logger.info(`Using Baileys version ${version}, isLatest: ${isLatest}`);
+
+    // Create socket connection
+    sock = makeWASocket({
+      version,
+      logger: pino({ level: 'silent' }), // Use silent mode for Baileys internal logging
+      printQRInTerminal: false, // We'll handle QR manually
+      auth: {
+        creds: state.creds,
+        keys: makeCacheableSignalKeyStore(state.keys, pino({ level: 'silent' })),
+      },
+      generateHighQualityLinkPreview: true,
+      // Browser info
+      browser: ['WhatsApp Webhook', 'Chrome', '120.0.0'],
+      markOnlineOnConnect: true,
+    });
+
+    // Handle connection updates
+    sock.ev.on('connection.update', async (update) => {
+      const { connection, lastDisconnect, qr } = update;
+
+      // Display QR code
+      if (qr) {
+        qrcode.generate(qr, { small: true });
+        logger.info('QR Code generated. Scan with WhatsApp to log in.');
+      }
+
+      // Handle connection status
+      if (connection === 'close') {
+        const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
+        logger.warn('Connection closed. Reason:', lastDisconnect?.error?.message);
+
+        if (shouldReconnect) {
+          logger.info('Reconnecting...');
+          setTimeout(() => {
+            initializeClient();
+          }, 5000);
+        } else {
+          logger.error('Logged out. Please delete baileys_auth folder and restart.');
+          isConnected = false;
+          setWhatsAppClient(null);
+        }
+      } else if (connection === 'open') {
+        logger.info('WhatsApp connection opened successfully!');
+        isConnected = true;
+        setWhatsAppClient(sock);
+      } else if (connection === 'connecting') {
+        logger.info('Connecting to WhatsApp...');
+        isConnected = false;
       }
     });
 
-// Initialize WhatsApp client
-const client = new Client({
-    authStrategy: new LocalAuth({ dataPath: path.join(__dirname, '.wwebjs_auth') }),
-    puppeteer: config.puppeteerOptions,
-    restartOnAuthFail: true,
-    qrMaxRetries: 5,
-    userAgent: process.env.USER_AGENT || 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-});
+    // Save credentials whenever they're updated
+    sock.ev.on('creds.update', saveCreds);
 
+    // Handle incoming messages
+    sock.ev.on('messages.upsert', async ({ messages, type }) => {
+      try {
+        if (type !== 'notify') return;
 
-// Error handling for client connection issues
-client.on('disconnected', (reason) => {
-  logger.warn('Client disconnected:', reason);
-  setTimeout(() => {
-    logger.info('Attempting to reconnect...');
-    initializeClient();
-  }, 15000); // Increased delay
-});
+        for (const message of messages) {
+          // Skip if message is from self
+          if (message.key.fromMe) continue;
 
-// Add browser disconnect handler
-client.on('browser_disconnect', () => {
-  logger.warn('Browser disconnected. Attempting to restart...');
-  setTimeout(() => {
-    initializeClient();
-  }, 10000);
-});
+          const messageContent = message.message?.conversation ||
+                                message.message?.extendedTextMessage?.text ||
+                                '';
 
-// Share the WhatsApp client instance with the webhook router
+          logger.debug(`Message received from ${message.key.remoteJid}: ${messageContent}`);
 
-client.on('qr', (qr) => {
-    qrcode.generate(qr, { small: true });
-    logger.info('QR Code generated. Scan with WhatsApp to log in.');
-  });
+          // Handle SchoolCode messages
+          if (messageContent.startsWith('SchoolCode:')) {
+            const groupId = message.key.remoteJid;
+            const logEntry = `${messageContent.trim()}, ${groupId}\n`;
 
-  client.on('authenticated', () => {
-    logger.info('Authentication successful!');
-  });
-
-  client.on('auth_failure', (msg) => {
-    logger.error('Authentication failure:', msg);
-
-    setTimeout(() => {
-      logger.info('Attempting to reconnect after auth failure...');
-      client.initialize().catch(err =>
-        logger.error('Failed to re-initialize after auth failure:', err)
-      );
-    }, 10000);
-  });
-
-  // Event: Ready
-  client.on('ready', () => {
-    setWhatsAppClient(client);
-    logger.info('WhatsApp client is ready!');
-  });
-
-  // Add more detailed event logging
-  client.on('loading_screen', (percent, message) => {
-    logger.info(`Loading screen: ${percent}% - ${message}`);
-  });
-
-  client.on('change_state', (state) => {
-    logger.info(`Client state changed to: ${state}`);
-  });
-
-  client.on('message', async (message) => {
-    try {
-      logger.debug(`Message received from ${message.from}: ${message.body}`);
-
-      if (message.body.startsWith('SchoolCode:')) {
-        const groupId = message.from;
-        const logEntry = `${message.body.trim()}, ${groupId}\n`;
-
-        // Append to file
-        fs.appendFile(logFilePath, logEntry, (err) => {
-          if (err) {
-            logger.error('Error writing to SchoolCode commands log file:', err);
-          } else {
-            logger.info(`Recorded SchoolCode command from group: ${groupId}`);
+            fs.appendFile(logFilePath, logEntry, (err) => {
+              if (err) {
+                logger.error('Error writing to SchoolCode commands log file:', err);
+              } else {
+                logger.info(`Recorded SchoolCode command from group: ${groupId}`);
+              }
+            });
           }
-        });
+        }
+      } catch (error) {
+        logger.error('Error handling message:', error);
       }
-    } catch (error) {
-      logger.error('Error handling message:', error);
+    });
+
+    // Handle group updates
+    sock.ev.on('groups.update', (updates) => {
+      for (const update of updates) {
+        logger.debug(`Group updated: ${update.id}`);
+      }
+    });
+
+    // Handle presence updates (optional)
+    sock.ev.on('presence.update', ({ id, presences }) => {
+      // You can handle presence updates here if needed
+    });
+
+  } catch (error) {
+    logger.error('Error initializing WhatsApp client:', error);
+    setTimeout(() => {
+      logger.info('Retrying initialization...');
+      initializeClient();
+    }, 10000);
+  }
+}
+
+// Process shutdown handling
+process.on('SIGINT', async () => {
+  logger.info('SIGINT received. Shutting down gracefully...');
+  try {
+    if (sock) {
+      await sock.logout();
+      logger.info('WhatsApp client logged out successfully');
     }
-  });
+  } catch (error) {
+    logger.error('Error during graceful shutdown:', error);
+  }
+  process.exit(0);
+});
 
-
-
-  // Event: Disconnected - moved up to avoid duplication
-  // (Handled above after client creation)
-
-  // Process shutdown handling
-  process.on('SIGINT', async () => {
-    logger.info('SIGINT received. Shutting down gracefully...');
-    try {
-      await client.destroy();
-      logger.info('WhatsApp client destroyed successfully');
-    } catch (error) {
-      logger.error('Error during graceful shutdown:', error);
+process.on('SIGTERM', async () => {
+  logger.info('SIGTERM received. Shutting down gracefully...');
+  try {
+    if (sock) {
+      await sock.logout();
+      logger.info('WhatsApp client logged out successfully');
     }
-    process.exit(0);
-  });
+  } catch (error) {
+    logger.error('Error during graceful shutdown:', error);
+  }
+  process.exit(0);
+});
 
-  process.on('SIGTERM', async () => {
-    logger.info('SIGTERM received. Shutting down gracefully...');
-    try {
-      await client.destroy();
-      logger.info('WhatsApp client destroyed successfully');
-    } catch (error) {
-      logger.error('Error during graceful shutdown:', error);
-    }
-    process.exit(0);
-  });
+// Uncaught exception handler
+process.on('uncaughtException', (error) => {
+  logger.error('Uncaught exception:', error);
+});
 
-  // Uncaught exception handler
-  process.on('uncaughtException', (error) => {
-    logger.error('Uncaught exception:', error);
-  });
+// Unhandled rejection handler
+process.on('unhandledRejection', (reason, promise) => {
+  logger.error('Unhandled rejection at:', promise, 'reason:', reason);
+});
 
-  // Start the Express server
-  const server = app.listen(config.server.port, () => {
-    logger.info(`Webhook server is running on port ${config.server.port}`);
-  });
+// Start the Express server
+const PORT = process.env.PORT || 3000;
+const server = app.listen(PORT, () => {
+  logger.info(`Webhook server is running on port ${PORT}`);
+});
 
-  // Set up image cleanup scheduler
-  setupImageCleanupScheduler();
+// Set up image cleanup scheduler
+setupImageCleanupScheduler();
 
-  logger.info('Initializing WhatsApp client...');
-
-  // Initialize client with proper error handling
-  let initAttempts = 0;
-  const maxInitAttempts = 5;
-
-  const initializeClient = async () => {
-    if (initAttempts >= maxInitAttempts) {
-      logger.error('Max initialization attempts reached. Stopping retries.');
-      return;
-    }
-
-    initAttempts++;
-    logger.info(`Initialization attempt ${initAttempts}/${maxInitAttempts}`);
-
-    try {
-      await client.initialize();
-      logger.info('Client initialization started successfully');
-      initAttempts = 0; // Reset on success
-    } catch (err) {
-      logger.error(`Failed to initialize client (attempt ${initAttempts}):`, err.message);
-
-      // Wait longer between retries for network issues
-      const delay = err.message.includes('ERR_INTERNET_DISCONNECTED') ? 30000 : 15000;
-
-      setTimeout(() => {
-        logger.info(`Retrying initialization in ${delay/1000} seconds...`);
-        initializeClient();
-      }, delay);
-    }
-  };
-
-  initializeClient();
+// Initialize WhatsApp client
+logger.info('Initializing WhatsApp client with Baileys...');
+initializeClient();

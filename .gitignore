@@ -6,6 +6,7 @@ node_modules/
 
 # WhatsApp authentication data
 .wwebjs_auth/
+baileys_auth/
 
 # Generated images
 images/

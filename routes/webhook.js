@@ -1,9 +1,9 @@
 const express = require('express');
-const { MessageMedia } = require('whatsapp-web.js');
+const { downloadMediaMessage } = require('@whiskeysockets/baileys');
+const fs = require('fs');
 const { htmlToImage } = require('../utils/imageUtils');
-const { getWhatsAppClient, whatsappClient } = require('../whatsappclient');
+const { getWhatsAppClient } = require('../whatsappclient');
 const logger = console;
-const { delay } = require('util');
 
 // Create router
 const router = express.Router();
@@ -19,50 +19,128 @@ const apiKeyAuth = (req, res, next) => {
   next();
 };
 
-// Add these helper functions
-async function sendMessageWithRetry(client, groupId, content, options = {}) {
+/**
+ * Helper function to prepare media message for Baileys
+ * @param {string} mediaPath - Path to the media file
+ * @param {string} mimeType - MIME type of the media
+ * @param {string} caption - Caption for the media
+ * @returns {Object} - Baileys message object
+ */
+function prepareMediaMessage(mediaPath, mimeType, caption = '') {
+  const mediaBuffer = fs.readFileSync(mediaPath);
+
+  if (mimeType.startsWith('image/')) {
+    return {
+      image: mediaBuffer,
+      caption: caption || undefined,
+    };
+  } else if (mimeType.startsWith('video/')) {
+    return {
+      video: mediaBuffer,
+      caption: caption || undefined,
+    };
+  } else if (mimeType.startsWith('audio/')) {
+    return {
+      audio: mediaBuffer,
+      mimetype: mimeType,
+    };
+  } else {
+    return {
+      document: mediaBuffer,
+      mimetype: mimeType,
+      fileName: caption || 'document',
+    };
+  }
+}
+
+/**
+ * Helper function to prepare media from base64
+ * @param {string} base64Data - Base64 encoded media
+ * @param {string} mimeType - MIME type of the media
+ * @param {string} caption - Caption for the media
+ * @returns {Object} - Baileys message object
+ */
+function prepareBase64Media(base64Data, mimeType, caption = '') {
+  const mediaBuffer = Buffer.from(base64Data, 'base64');
+
+  if (mimeType.startsWith('image/')) {
+    return {
+      image: mediaBuffer,
+      caption: caption || undefined,
+    };
+  } else if (mimeType.startsWith('video/')) {
+    return {
+      video: mediaBuffer,
+      caption: caption || undefined,
+    };
+  } else if (mimeType.startsWith('audio/')) {
+    return {
+      audio: mediaBuffer,
+      mimetype: mimeType,
+    };
+  } else {
+    return {
+      document: mediaBuffer,
+      mimetype: mimeType,
+      fileName: caption || 'document',
+    };
+  }
+}
+
+/**
+ * Helper function to download media from URL
+ * @param {string} url - URL to download from
+ * @returns {Promise<Buffer>} - Media buffer
+ */
+async function downloadFromUrl(url) {
+  const https = require('https');
+  const http = require('http');
+
+  return new Promise((resolve, reject) => {
+    const client = url.startsWith('https') ? https : http;
+
+    client.get(url, (response) => {
+      if (response.statusCode !== 200) {
+        reject(new Error(`Failed to download: ${response.statusCode}`));
+        return;
+      }
+
+      const chunks = [];
+      response.on('data', (chunk) => chunks.push(chunk));
+      response.on('end', () => resolve(Buffer.concat(chunks)));
+      response.on('error', reject);
+    }).on('error', reject);
+  });
+}
+
+/**
+ * Send message with retry logic
+ */
+async function sendMessageWithRetry(client, groupId, message, options = {}) {
   const MAX_RETRIES = 3;
   let lastError = null;
 
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
     try {
-      // Make sure client is properly initialized before each attempt
-      if (!client.pupPage || !client.pupBrowser) {
-        throw new Error('WhatsApp client not fully initialized');
+      // Ensure groupId has correct format (should end with @g.us for groups or @s.whatsapp.net for individuals)
+      let formattedGroupId = groupId;
+      if (!groupId.includes('@')) {
+        // If it's a group, it should end with @g.us
+        formattedGroupId = groupId.includes('-') ? `${groupId}@g.us` : `${groupId}@s.whatsapp.net`;
       }
 
-      // Wait a bit to ensure client is ready
-      await new Promise(resolve => setTimeout(resolve, 2000));
-
-      // Attempt to send the message
-      const result = await client.sendMessage(groupId, content, options);
+      // Send message using Baileys
+      const result = await client.sendMessage(formattedGroupId, message, options);
       return result;
     } catch (error) {
       lastError = error;
       logger.warn(`Attempt ${attempt}/${MAX_RETRIES} failed:`, error.message);
 
-      // Check if it's a WidFactory error or other initialization error
-      if (error.message.includes('WidFactory') ||
-          error.message.includes('undefined') ||
-          error.message.includes('not fully initialized')) {
-
-        // Wait longer between retries (exponential backoff)
-        const retryDelay = Math.pow(2, attempt) * 3000;
+      if (attempt < MAX_RETRIES) {
+        // Exponential backoff
+        const retryDelay = Math.pow(2, attempt) * 1000;
         logger.info(`Waiting ${retryDelay}ms before retry...`);
         await new Promise(resolve => setTimeout(resolve, retryDelay));
-
-        // Try to ensure client is ready
-        try {
-          // Force client to refresh state if possible
-          if (client.refreshState) {
-            await client.refreshState();
-          }
-        } catch (refreshError) {
-          logger.warn('Failed to refresh client state:', refreshError.message);
-        }
-      } else {
-        // For other errors, don't retry
-        break;
       }
     }
   }
@@ -74,7 +152,7 @@ async function sendMessageWithRetry(client, groupId, content, options = {}) {
 // Webhook endpoint to send messages
 router.post('/send', apiKeyAuth, async (req, res) => {
   try {
-    const { groupId, message, mediaType, mediaContent, html,sendHd } = req.body;
+    const { groupId, message, mediaType, mediaContent, html, sendHd } = req.body;
 
     // Validate required parameters
     if (!groupId) {
@@ -90,24 +168,21 @@ router.post('/send', apiKeyAuth, async (req, res) => {
 
     // Check if client is ready
     const whatsappClient = getWhatsAppClient();
-    if (!whatsappClient || !whatsappClient.info) {
+    if (!whatsappClient) {
       return res.status(503).json({
         success: false,
         message: 'WhatsApp client is not ready yet. Please try again later.'
       });
     }
 
-    let media = null;
-    let captionText = message || '';
+    let messageContent = null;
+    const captionText = message || '';
 
     // Process HTML content if provided
     if (html) {
       try {
-        const { filePath, fileName } = await htmlToImage(html);
-        console.log(filePath, fileName);
-        media = MessageMedia.fromFilePath(
-            `./${filePath}`
-        );
+        const { filePath, fileName } = await htmlToImage({ htmlContent: html });
+        messageContent = prepareMediaMessage(filePath, 'image/png', captionText);
         logger.info(`HTML converted to image: ${fileName}`);
       } catch (error) {
         logger.error('Error converting HTML to image:', error);
@@ -121,22 +196,39 @@ router.post('/send', apiKeyAuth, async (req, res) => {
     // Process media content if provided and no HTML
     else if (mediaContent && mediaType) {
       try {
-        // Handle base64 media content
         if (mediaType === 'base64') {
-          // Try to determine the mime type from the base64 data
-          let mimeType = 'image/png';  // Default
+          // Handle base64 media content
+          let mimeType = 'image/png'; // Default
+          let base64Data = mediaContent;
+
           if (mediaContent.startsWith('data:')) {
             const matches = mediaContent.match(/^data:([A-Za-z-+/]+);base64,(.+)$/);
             if (matches && matches.length === 3) {
               mimeType = matches[1];
-              mediaContent = matches[2];
+              base64Data = matches[2];
             }
           }
-          media = new MessageMedia(mimeType, mediaContent);
+
+          messageContent = prepareBase64Media(base64Data, mimeType, captionText);
         }
         // Handle remote URL media content
         else if (mediaType === 'url') {
-          media = await MessageMedia.fromUrl(mediaContent);
+          const mediaBuffer = await downloadFromUrl(mediaContent);
+
+          // Try to determine MIME type from URL or default to image
+          let mimeType = 'image/jpeg';
+          if (mediaContent.includes('.png')) mimeType = 'image/png';
+          else if (mediaContent.includes('.gif')) mimeType = 'image/gif';
+          else if (mediaContent.includes('.mp4')) mimeType = 'video/mp4';
+          else if (mediaContent.includes('.pdf')) mimeType = 'application/pdf';
+
+          if (mimeType.startsWith('image/')) {
+            messageContent = { image: mediaBuffer, caption: captionText || undefined };
+          } else if (mimeType.startsWith('video/')) {
+            messageContent = { video: mediaBuffer, caption: captionText || undefined };
+          } else {
+            messageContent = { document: mediaBuffer, mimetype: mimeType, fileName: captionText || 'document' };
+          }
         }
         else {
           return res.status(400).json({
@@ -155,16 +247,11 @@ router.post('/send', apiKeyAuth, async (req, res) => {
     }
 
     // Send message with or without media
-    if (media) {
-        const mediaOptions = {
-            caption: captionText,
-            // Set quality to 100 for HD images while still showing preview
-            sendVideoAsGif: false,
-        }
-        await whatsappClient.sendMessage(groupId, media, mediaOptions);
+    if (messageContent) {
+      await sendMessageWithRetry(whatsappClient, groupId, messageContent);
       logger.info(`Message with media sent to ${groupId}`);
     } else {
-      await whatsappClient.sendMessage(groupId, captionText);
+      await sendMessageWithRetry(whatsappClient, groupId, { text: captionText });
       logger.info(`Text message sent to ${groupId}`);
     }
 
@@ -188,9 +275,9 @@ router.post('/send-batch', apiKeyAuth, async (req, res) => {
   try {
     const { messages } = req.body;
     const MAX_BATCH_SIZE = parseInt(process.env.MAX_BATCH_SIZE || '1000');
-    const MESSAGE_DELAY_MS = parseInt(process.env.MESSAGE_DELAY_MS || '5000'); // Increased delay
+    const MESSAGE_DELAY_MS = parseInt(process.env.MESSAGE_DELAY_MS || '5000');
 
-    // Validation checks remain the same
+    // Validation checks
     if (!Array.isArray(messages)) {
       logger.error('Invalid messages parameter:', messages);
       return res.status(400).json({
@@ -217,16 +304,12 @@ router.post('/send-batch', apiKeyAuth, async (req, res) => {
 
     const whatsappClient = getWhatsAppClient();
     if (!whatsappClient) {
-      logger.error('WhatsApp client is not ready', whatsappClient);
+      logger.error('WhatsApp client is not ready');
       return res.status(503).json({
         success: false,
         message: 'WhatsApp client is not ready yet. Please try again later.'
       });
     }
-
-    // Wait a bit to ensure client is ready
-    // logger.info('Waiting to ensure WhatsApp client is ready...');
-    // await new Promise(resolve => setTimeout(resolve, 3000));
 
     let successCount = 0;
     let failureCount = 0;
@@ -238,86 +321,97 @@ router.post('/send-batch', apiKeyAuth, async (req, res) => {
       totalMessages: messages.length
     });
 
-    // Process messages sequentially instead of in parallel
+    // Process messages sequentially
     for (let i = 0; i < messages.length; i++) {
       try {
         const messageData = messages[i];
-        const { groupId, message, mediaType, mediaContent, html, sendHd, vh,vw } = messageData;
+        const { groupId, message, mediaType, mediaContent, html, sendHd, vh, vw } = messageData;
 
         // Validate this specific message
         if (!groupId) {
           failureCount++;
           logger.warn(`Message ${i+1}/${messages.length} missing groupId`);
-          continue; // Skip to next message
+          continue;
         }
 
         if (!message && !mediaContent && !html) {
           failureCount++;
           logger.warn(`Message ${i+1}/${messages.length} missing content for group ${groupId}`);
-          continue; // Skip to next message
+          continue;
         }
 
-        let media = null;
-        let captionText = message || '';
+        let messageContent = null;
+        const captionText = message || '';
 
         // Process HTML content if provided
         if (html) {
           try {
             const { filePath, fileName } = await htmlToImage({
-                htmlContent: html,
-                vw,
-                vh
+              htmlContent: html,
+              vw,
+              vh
             });
-            media = MessageMedia.fromFilePath(`./${filePath}`);
+            messageContent = prepareMediaMessage(filePath, 'image/png', captionText);
             logger.info(`HTML converted to image: ${fileName}`);
           } catch (error) {
             failureCount++;
             logger.error(`Error converting HTML to image for message ${i+1}/${messages.length}:`, error);
-            continue; // Skip to next message
+            continue;
           }
         }
         // Process media content if provided
         else if (mediaContent && mediaType) {
           try {
             if (mediaType === 'base64') {
-              let mimeType = 'image/png';  // Default
-              let processedContent = mediaContent;
+              let mimeType = 'image/png';
+              let base64Data = mediaContent;
+
               if (mediaContent.startsWith('data:')) {
                 const matches = mediaContent.match(/^data:([A-Za-z-+/]+);base64,(.+)$/);
                 if (matches && matches.length === 3) {
                   mimeType = matches[1];
-                  processedContent = matches[2];
+                  base64Data = matches[2];
                 }
               }
-              media = new MessageMedia(mimeType, processedContent);
+
+              messageContent = prepareBase64Media(base64Data, mimeType, captionText);
             }
             else if (mediaType === 'url') {
-              media = await MessageMedia.fromUrl(mediaContent);
+              const mediaBuffer = await downloadFromUrl(mediaContent);
+
+              let mimeType = 'image/jpeg';
+              if (mediaContent.includes('.png')) mimeType = 'image/png';
+              else if (mediaContent.includes('.gif')) mimeType = 'image/gif';
+              else if (mediaContent.includes('.mp4')) mimeType = 'video/mp4';
+              else if (mediaContent.includes('.pdf')) mimeType = 'application/pdf';
+
+              if (mimeType.startsWith('image/')) {
+                messageContent = { image: mediaBuffer, caption: captionText || undefined };
+              } else if (mimeType.startsWith('video/')) {
+                messageContent = { video: mediaBuffer, caption: captionText || undefined };
+              } else {
+                messageContent = { document: mediaBuffer, mimetype: mimeType, fileName: captionText || 'document' };
+              }
             }
             else {
               failureCount++;
               logger.warn(`Invalid mediaType for message ${i+1}/${messages.length}, group ${groupId}: ${mediaType}`);
-              continue; // Skip to next message
+              continue;
             }
           } catch (error) {
             failureCount++;
             logger.error(`Error processing media content for message ${i+1}/${messages.length}:`, error);
-            continue; // Skip to next message
+            continue;
           }
         }
 
         // Send message with retry mechanism
         try {
-          if (media) {
-            const mediaOptions = {
-              caption: captionText,
-              sendVideoAsGif: false,
-            };
-
-            await sendMessageWithRetry(whatsappClient, groupId, media, mediaOptions);
+          if (messageContent) {
+            await sendMessageWithRetry(whatsappClient, groupId, messageContent);
             logger.info(`Message ${i+1}/${messages.length} with media sent to ${groupId}`);
           } else {
-            await sendMessageWithRetry(whatsappClient, groupId, captionText);
+            await sendMessageWithRetry(whatsappClient, groupId, { text: captionText });
             logger.info(`Text message ${i+1}/${messages.length} sent to ${groupId}`);
           }
 
@@ -325,26 +419,20 @@ router.post('/send-batch', apiKeyAuth, async (req, res) => {
         } catch (sendError) {
           failureCount++;
           logger.error(`All retries failed for message ${i+1}/${messages.length}:`, sendError);
-
-          // If we're getting WidFactory errors, we should increase the delay
-          if (sendError.message.includes('WidFactory')) {
-            logger.info(`Increasing delay to ensure client stabilizes...`);
-            await new Promise(resolve => setTimeout(resolve, MESSAGE_DELAY_MS * 2));
-          }
         }
 
-        // Add longer delay between messages to prevent overwhelming the client
+        // Add delay between messages
         if (i < messages.length - 1) {
           logger.info(`Waiting ${MESSAGE_DELAY_MS}ms before processing next message...`);
           await new Promise(resolve => setTimeout(resolve, MESSAGE_DELAY_MS));
         }
 
-        // Log progress every message
+        // Log progress
         logger.info(`Batch progress: ${i+1}/${messages.length} messages processed (${successCount} successful, ${failureCount} failed)`);
 
         // Free up memory
-        if (media) {
-          media = null;
+        if (messageContent) {
+          messageContent = null;
         }
       } catch (messageError) {
         failureCount++;
@@ -354,14 +442,14 @@ router.post('/send-batch', apiKeyAuth, async (req, res) => {
 
     logger.info(`Batch processing completed: ${successCount} successful, ${failureCount} failed`);
   } catch (error) {
-    console.log(error)
     logger.error('Fatal error in batch processing:', error);
   }
 });
 
 // Health check endpoint (not requiring API key)
 router.get('/health', (req, res) => {
-  const status = whatsappClient && whatsappClient.info ? 'ready' : 'initializing';
+  const client = getWhatsAppClient();
+  const status = client ? 'ready' : 'initializing';
   res.status(200).json({
     success: true,
     service: 'whatsapp-webhook',
@@ -371,5 +459,4 @@ router.get('/health', (req, res) => {
 
 module.exports = {
   router,
-
 };
