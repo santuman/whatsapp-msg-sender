@@ -3,13 +3,6 @@ const fs = require('fs');
 const path = require('path');
 const express = require('express');
 const cors = require('cors');
-const {
-	default: makeWASocket,
-	useMultiFileAuthState,
-	DisconnectReason,
-	fetchLatestBaileysVersion,
-	makeCacheableSignalKeyStore,
-} = require('@whiskeysockets/baileys');
 const pino = require('pino');
 const { router: webhookRouter } = require('./routes/webhook');
 const { setupImageCleanupScheduler } = require('./utils/imageUtils');
@@ -52,6 +45,15 @@ let isConnected = false;
 // Initialize WhatsApp client with Baileys
 async function initializeClient() {
 	try {
+		// Baileys is ESM-only — load via dynamic import from CommonJS
+		const {
+			default: makeWASocket,
+			useMultiFileAuthState,
+			DisconnectReason,
+			fetchLatestBaileysVersion,
+			makeCacheableSignalKeyStore,
+		} = await import('@whiskeysockets/baileys');
+
 		const authFolder = path.join(__dirname, 'baileys_auth');
 
 		// Ensure auth folder exists

@@ -1,5 +1,4 @@
 const express = require('express');
-const { downloadMediaMessage } = require('@whiskeysockets/baileys');
 const fs = require('fs');
 const { htmlToImage } = require('../utils/imageUtils');
 const { getWhatsAppClient } = require('../whatsappclient');
