@@ -102,8 +102,8 @@ async function initializeClient() {
 					lastDisconnect?.error?.output?.statusCode !==
 					DisconnectReason.loggedOut;
 				logger.warn(
-					'Connection closed. Reason:',
-					lastDisconnect?.error?.message
+					{ err: lastDisconnect?.error },
+					'Connection closed'
 				);
 
 				if (shouldReconnect) {
@@ -170,15 +170,15 @@ async function initializeClient() {
 						};
 
 						await fetch(
-							`${process.env.AA_WAPP_KEY}/config/whatsapp`,
+							`${process.env.AA_WAPP_API}/config/whatsapp`,
 							requestOptions
 						);
 
 						fs.appendFile(logFilePath, logEntry, (err) => {
 							if (err) {
 								logger.error(
-									'Error writing to SchoolCode commands log file:',
-									err
+									{ err },
+									'Error writing to SchoolCode commands log file'
 								);
 							} else {
 								logger.info(
@@ -189,7 +189,7 @@ async function initializeClient() {
 					}
 				}
 			} catch (error) {
-				logger.error('Error handling message:', error);
+				logger.error({ err: error }, 'Error handling message');
 			}
 		});
 
@@ -205,7 +205,7 @@ async function initializeClient() {
 			// You can handle presence updates here if needed
 		});
 	} catch (error) {
-		logger.error('Error initializing WhatsApp client:', error);
+		logger.error({ err: error }, 'Error initializing WhatsApp client');
 		setTimeout(() => {
 			logger.info('Retrying initialization...');
 			initializeClient();
@@ -222,7 +222,7 @@ process.on('SIGINT', async () => {
 			logger.info('WhatsApp client logged out successfully');
 		}
 	} catch (error) {
-		logger.error('Error during graceful shutdown:', error);
+		logger.error({ err: error }, 'Error during graceful shutdown');
 	}
 	process.exit(0);
 });
@@ -235,19 +235,19 @@ process.on('SIGTERM', async () => {
 			logger.info('WhatsApp client logged out successfully');
 		}
 	} catch (error) {
-		logger.error('Error during graceful shutdown:', error);
+		logger.error({ err: error }, 'Error during graceful shutdown');
 	}
 	process.exit(0);
 });
 
 // Uncaught exception handler
 process.on('uncaughtException', (error) => {
-	logger.error('Uncaught exception:', error);
+	logger.error({ err: error }, 'Uncaught exception');
 });
 
 // Unhandled rejection handler
 process.on('unhandledRejection', (reason, promise) => {
-	logger.error('Unhandled rejection at:', promise, 'reason:', reason);
+	logger.error({ err: reason }, 'Unhandled rejection');
 });
 
 // Start the Express server
