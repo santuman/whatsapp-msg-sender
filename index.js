@@ -160,7 +160,7 @@ async function initializeClient() {
 						};
 
 						const requestOptions = {
-							method: 'POST',
+							method: 'PUT',
 							headers: {
 								'Content-Type': 'application/json',
 								Accept: 'application/json',
